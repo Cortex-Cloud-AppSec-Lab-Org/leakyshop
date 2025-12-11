@@ -7,39 +7,70 @@ on:
 jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
 
     steps:
     - uses: actions/checkout@v3
 
-    # VULNERABILITY: Secrets printed to logs
+    # 1. Configure AWS Credentials
     - name: Configure AWS Credentials
-      run: |
-        echo "Configuring AWS with Key: ${{ secrets.AWS_ACCESS_KEY_ID }}"
-        aws configure set aws_access_key_id ${{ secrets.AWS_ACCESS_KEY_ID }}
-        aws configure set aws_secret_access_key ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      uses: aws-actions/configure-aws-credentials@v2
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: us-east-1
 
-    # VULNERABILITY: Intentional Data Leak to Public S3
-    - name: Backup Env to S3
-      run: |
-        env > .env
-        aws s3 cp .env s3://leaky-bucket-shop-public-data-12345/debug_env.txt --acl public-read
+    - name: Get AWS Account ID
+      id: creds
+      run: echo "aws_account_id=$(aws sts get-caller-identity --query Account --output text)" >> $GITHUB_OUTPUT
 
-    - name: Install Dependencies
+    # 2. Provision Pre-requisites (Setup Stage)
+    - name: Terraform Apply (Setup)
       run: |
-        cd backend
-        npm install --no-audit
-
-    # VULNERABILITY: Build & Push without scanning
-    - name: Build and Push Docker
-      run: |
-        cd backend
-        docker build -t leaky-bucket-app:latest .
-        aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin 123456789012.dkr.ecr.us-east-1.amazonaws.com
-        docker tag leaky-bucket-app:latest 123456789012.dkr.ecr.us-east-1.amazonaws.com/leaky-bucket-repo:latest
-        docker push 123456789012.dkr.ecr.us-east-1.amazonaws.com/leaky-bucket-repo:latest
-
-    - name: Terraform Apply
-      run: |
-        cd infrastructure
+        cd infrastructure/setup
         terraform init
         terraform apply -auto-approve
+
+    # 3. Build & Push Image
+    - name: Login to Amazon ECR
+      id: login-ecr
+      uses: aws-actions/amazon-ecr-login@v1
+
+    - name: Build and Push Docker Image
+      env:
+        ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        ECR_REPOSITORY: leaky-bucket-repo
+        IMAGE_TAG: latest
+      run: |
+        cd backend
+        docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
+        docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+
+    # 4. Provision Runtime (App Stage)
+    - name: Terraform Apply (App)
+      run: |
+        cd infrastructure/app
+        terraform init
+        terraform apply -auto-approve
+
+    # 5. DEPLOY TO KUBERNETES
+    - name: Deploy to EKS
+      env:
+        ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        ECR_REPOSITORY: leaky-bucket-repo
+        IMAGE_TAG: latest
+        CLUSTER_NAME: leaky-cluster
+      run: |
+        # 1. Update kubeconfig to authenticate with the new cluster
+        aws eks update-kubeconfig --name $CLUSTER_NAME --region us-east-1
+        
+        # 2. Replace the placeholder image URL in the manifest with the real one
+        sed -i "s|REPLACE_WITH_ECR_IMAGE_URL|$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG|g" kubernetes/leaky-app.yaml
+        
+        # 3. Apply the manifests
+        kubectl apply -f kubernetes/leaky-app.yaml
+        
+        # 4. Check status
+        kubectl get services
