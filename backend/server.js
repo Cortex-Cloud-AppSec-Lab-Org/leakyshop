@@ -11,7 +11,7 @@ const app = express();
 
 app.use(bodyParser.json());
 
-// --- SERVE FRONTEND STATIC FILES ---
+// --- CRITICAL FIX: SERVE FRONTEND STATIC FILES ---
 // This tells Express to look for files in the 'public' folder
 app.use(express.static(path.join(__dirname, 'public')));
 
@@ -19,7 +19,6 @@ const JWT_SECRET = 'secret_key_12345'; // Hardcoded Secret
 
 // Database Connection
 const client = new pg.Client({
-  // FIX: Updated username to match RDS configuration
   user: 'cortexcloudadmin',
   host: process.env.DB_HOST || 'leaky-shop-db.cxxxxx.us-east-1.rds.amazonaws.com',
   database: 'shopdb',
@@ -59,13 +58,14 @@ app.post('/api/login', async (req, res) => {
   res.status(401).send('Invalid credentials');
 });
 
-// --- CATCH-ALL ROUTE ---
+// --- CRITICAL FIX: CATCH-ALL ROUTE ---
 // If the user goes to /, serve the React App.
 app.get('*', (req, res) => {
   const indexPath = path.join(__dirname, 'public', 'index.html');
   if (fs.existsSync(indexPath)) {
     res.sendFile(indexPath);
   } else {
+    // If the build failed or files aren't there, show a simple message (Status 200)
     res.send('<h1>LeakyBucket API is running</h1><p>Frontend assets not found in /public.</p>');
   }
 });
