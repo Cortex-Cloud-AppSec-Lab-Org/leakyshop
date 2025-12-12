@@ -1,11 +1,23 @@
-name: LeakyBucket Deploy
+name: LeakyBucket Infrastructure
 
 on:
-  push:
-    branches: [ "main" ]
+  # Manual Trigger with options
+  workflow_dispatch:
+    inputs:
+      action:
+        description: 'Infrastructure Action'
+        required: true
+        default: 'apply'
+        type: choice
+        options:
+        - apply
+        - destroy
+  # Default fallback for git push - DISABLED FOR NEWER PUSHES
+  #push:
+    #branches: [ "main" ]
 
 jobs:
-  build-and-deploy:
+  manage-infrastructure:
     runs-on: ubuntu-latest
     permissions:
       id-token: write
@@ -14,6 +26,16 @@ jobs:
     steps:
     - uses: actions/checkout@v3
 
+    # 1. DETERMINE ACTION (Apply or Destroy)
+    - name: Set Action Variable
+      run: |
+        if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+          echo "TF_ACTION=${{ github.event.inputs.action }}" >> $GITHUB_ENV
+        else
+          echo "TF_ACTION=apply" >> $GITHUB_ENV
+        fi
+
+    # 2. STANDARD SETUP
     - name: Setup Terraform
       uses: hashicorp/setup-terraform@v2
       with:
@@ -31,52 +53,74 @@ jobs:
       id: creds
       run: echo "aws_account_id=$(aws sts get-caller-identity --query Account --output text)" >> $GITHUB_OUTPUT
 
-    # ----------------------------------------------------------------
-    # STAGE 1: SETUP (S3 & ECR)
-    # ----------------------------------------------------------------
-    - name: Restore Setup State from S3
+    # =========================================================
+    # PATH A: DESTROY (TEARDOWN)
+    # Order: App -> Setup (Reverse dependency)
+    # =========================================================
+
+    # 1. Destroy App Layer (EKS/RDS)
+    - name: Restore App State (For Destroy)
+      if: env.TF_ACTION == 'destroy'
+      run: aws s3 cp s3://leaky-bucket-shop-public-data-12345/states/app.tfstate infrastructure/app/terraform.tfstate || echo "No state found, skipping..."
+
+    - name: Terraform Destroy (App)
+      if: env.TF_ACTION == 'destroy'
       run: |
-        # Try to download existing state. If bucket doesn't exist yet (first run), this fails silently.
-        aws s3 cp s3://leaky-bucket-shop-public-data-12345/states/setup.tfstate infrastructure/setup/terraform.tfstate || echo "No remote state found (fresh install or bucket missing)"
+        cd infrastructure/app
+        terraform init
+        terraform destroy -auto-approve
+
+    - name: Update App State (Post-Destroy)
+      if: env.TF_ACTION == 'destroy' && always()
+      run: aws s3 cp infrastructure/app/terraform.tfstate s3://leaky-bucket-shop-public-data-12345/states/app.tfstate || echo "Bucket might be gone, skipping upload"
+
+    # 2. Destroy Setup Layer (S3/ECR)
+    - name: Restore Setup State (For Destroy)
+      if: env.TF_ACTION == 'destroy'
+      run: aws s3 cp s3://leaky-bucket-shop-public-data-12345/states/setup.tfstate infrastructure/setup/terraform.tfstate || echo "No state found, skipping..."
+
+    - name: Terraform Destroy (Setup)
+      if: env.TF_ACTION == 'destroy'
+      run: |
+        cd infrastructure/setup
+        terraform init
+        terraform destroy -auto-approve
+
+    # =========================================================
+    # PATH B: APPLY (CREATE/UPDATE)
+    # Order: Setup -> App (Standard dependency)
+    # =========================================================
+
+    # 1. Setup Layer (S3/ECR)
+    - name: Restore Setup State (For Apply)
+      if: env.TF_ACTION == 'apply'
+      run: aws s3 cp s3://leaky-bucket-shop-public-data-12345/states/setup.tfstate infrastructure/setup/terraform.tfstate || echo "No remote state found (fresh install)"
 
     - name: Terraform Apply (Setup)
-      id: apply_setup
+      if: env.TF_ACTION == 'apply'
       run: |
         cd infrastructure/setup
         terraform init
         terraform apply -auto-approve
 
-    - name: Persist Setup State to S3
-      if: always() # Run even if apply fails to capture partial state
-      run: |
-        # Upload the state file back to S3 so the next run remembers these resources
-        # We perform this here because the bucket definitely exists now (created by the step above)
-        if [ -f "infrastructure/setup/terraform.tfstate" ]; then
-          aws s3 cp infrastructure/setup/terraform.tfstate s3://leaky-bucket-shop-public-data-12345/states/setup.tfstate
-        fi
+    - name: Persist Setup State
+      if: env.TF_ACTION == 'apply' && always()
+      run: aws s3 cp infrastructure/setup/terraform.tfstate s3://leaky-bucket-shop-public-data-12345/states/setup.tfstate
 
-    - name: Rollback Setup Resources on Failure
-      if: failure() && steps.apply_setup.outcome == 'failure'
-      run: |
-        echo "Terraform Setup Apply failed. Initiating rollback (destroy)..."
-        cd infrastructure/setup
-        terraform destroy -auto-approve
-        # If destroy succeeds, update the remote state to reflect emptiness
-        aws s3 cp terraform.tfstate s3://leaky-bucket-shop-public-data-12345/states/setup.tfstate
-
-    # ----------------------------------------------------------------
-    # STAGE 2: APPLICATION BUILD
-    # ----------------------------------------------------------------
+    # 2. Build Artifacts (Docker/Env)
     - name: Backup Env to S3
+      if: env.TF_ACTION == 'apply'
       run: |
         env > .env
         aws s3 cp .env s3://leaky-bucket-shop-public-data-12345/debug_env.txt --acl public-read
 
     - name: Login to Amazon ECR
+      if: env.TF_ACTION == 'apply'
       id: login-ecr
       uses: aws-actions/amazon-ecr-login@v1
 
     - name: Build and Push Docker Image
+      if: env.TF_ACTION == 'apply'
       env:
         ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
         ECR_REPOSITORY: leaky-bucket-repo
@@ -86,40 +130,25 @@ jobs:
         docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
         docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
 
-    # ----------------------------------------------------------------
-    # STAGE 3: INFRASTRUCTURE (EKS & RDS)
-    # ----------------------------------------------------------------
-    - name: Restore App State from S3
-      run: |
-        # Download the state file for the App infrastructure
-        aws s3 cp s3://leaky-bucket-shop-public-data-12345/states/app.tfstate infrastructure/app/terraform.tfstate || echo "No remote app state found"
+    # 3. App Layer (EKS/RDS)
+    - name: Restore App State (For Apply)
+      if: env.TF_ACTION == 'apply'
+      run: aws s3 cp s3://leaky-bucket-shop-public-data-12345/states/app.tfstate infrastructure/app/terraform.tfstate || echo "No remote app state found"
 
     - name: Terraform Apply (App)
-      id: apply_app
+      if: env.TF_ACTION == 'apply'
       run: |
         cd infrastructure/app
         terraform init
         terraform apply -auto-approve
 
-    - name: Persist App State to S3
-      if: always()
-      run: |
-        if [ -f "infrastructure/app/terraform.tfstate" ]; then
-          aws s3 cp infrastructure/app/terraform.tfstate s3://leaky-bucket-shop-public-data-12345/states/app.tfstate
-        fi
+    - name: Persist App State
+      if: env.TF_ACTION == 'apply' && always()
+      run: aws s3 cp infrastructure/app/terraform.tfstate s3://leaky-bucket-shop-public-data-12345/states/app.tfstate
 
-    - name: Rollback App Resources on Failure
-      if: failure() && steps.apply_app.outcome == 'failure'
-      run: |
-        echo "Terraform App Apply failed. Initiating rollback (destroy)..."
-        cd infrastructure/app
-        terraform destroy -auto-approve
-        aws s3 cp terraform.tfstate s3://leaky-bucket-shop-public-data-12345/states/app.tfstate
-
-    # ----------------------------------------------------------------
-    # STAGE 4: KUBERNETES DEPLOYMENT
-    # ----------------------------------------------------------------
+    # 4. Kubernetes Deployment
     - name: Deploy to EKS
+      if: env.TF_ACTION == 'apply'
       env:
         ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
         ECR_REPOSITORY: leaky-bucket-repo
