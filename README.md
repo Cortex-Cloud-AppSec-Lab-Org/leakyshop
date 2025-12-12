@@ -112,17 +112,7 @@ The entire infrastructure provisioning and application deployment are handled by
     * **`destroy`:** Tears down all the infrastructure (EKS, RDS, etc.) in reverse order.
 5.  **Monitor:** Once the job completes, check the "Deploy to EKS" step output or the job summary for the final application URL.
 
-#### 2. Build & Deploy Application
-(In a real scenario, the GitHub Action handles this, but you can run locally to simulate the build process)
-
-```bash
-cd backend
-npm install
-# Note: This Dockerfile runs as Root
-docker build -t leaky-bucket-app .
-```
-
-#### 3. Attack Scenarios to Test
+#### 2. Attack Scenarios to Test
 * **CNAPP/CSPM:** Detect the `0.0.0.0/0` Security Groups and Public RDS.
 * **SCA:** Flag `lodash 4.17.15` in `package.json`.
 * **SAST:** Find the `exec(command)` RCE in `server.js`.
