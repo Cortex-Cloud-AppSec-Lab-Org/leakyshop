@@ -72,10 +72,7 @@ sequenceDiagram
     participant User as User/Attacker
     participant DB as RDS Database
 
-    box "Runtime Environment"
-        K8s
-        DB
-    end
+    Note over K8s, DB: Runtime Environment Components
 
     Note over Dev, K8s: Phase 1: Deployment & State Management
     Dev->>S3: Download Terraform State (setup.tfstate / app.tfstate)
