@@ -259,8 +259,8 @@ jobs:
       if: env.TF_ACTION == 'apply' && env.DEPLOYED_URL != ''
       run: |
         echo "Running smoke tests against: ${{ env.DEPLOYED_URL }}"
-        echo "Waiting 30s for DNS propagation..."
-        sleep 30
+        echo "Waiting 180s for DNS propagation..."
+        sleep 180
         
         # Attempt to curl the endpoint
         response=$(curl --write-out "%{http_code}\n" --silent --output /dev/null "${{ env.DEPLOYED_URL }}")
